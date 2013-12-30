@@ -1,0 +1,12 @@
+{application, ssh_scp,
+ [
+  {description, ""},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [
+                  kernel,
+                  stdlib
+                 ]},
+  {mod, { ssh_scp, []}},
+  {env, []}
+ ]}.
