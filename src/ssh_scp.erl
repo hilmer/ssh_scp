@@ -8,6 +8,8 @@
 -module(ssh_scp).
 
 -include_lib("kernel/include/file.hrl").
+-include_lib("ssh/src/ssh_connect.hrl").
+
 
 -include("include/ssh_scp_opts.hrl").
 
@@ -40,9 +42,9 @@ to(ConnectionRef, Filename, Destination) ->
 %%--------------------------------------------------------------------
 to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts) ->
     Timeout = case Opts#ssh_scp_opts.timeout of undefined -> 30000; T -> T end,
-    Permission = file_mode_to_permission_string(Opts#ssh_scp_opts.mode),
     case (file:read_file_info(Filename)) of 
       {ok, FileInfo} ->
+            Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
             case FileInfo#file_info.type of
                 regular ->
                     with_transfer_channel(
@@ -58,9 +60,9 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
                       ConnectionRef,Timeout, Destination,
                       fun(ChannelId) ->
                               Name = filename:basename(Filename),
-                              case send_dir_start(ConnectionRef,ChannelId,Name,Permission) of
+                              case send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo) of
                                   ok ->
-                                      case send_dir(ConnectionRef,ChannelId,Filename,Permission) of
+                                      case send_dir(ConnectionRef,ChannelId,Filename) of
                                           ok -> case send_dir_end(ConnectionRef, ChannelId, Name) of
                                                     ok -> send_eof(ConnectionRef,ChannelId);
                                                     Err1 -> Err1
@@ -78,20 +80,21 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
 %%--------------------------------------------------------------------  
 %% Traverse directory structure recursively. And transfer files
 %%--------------------------------------------------------------------  
-send_dir(ConnectionRef,ChannelId,Dir,Permission) ->
-    traverse_abs(ConnectionRef,ChannelId,filename:absname(Dir),Permission).
+send_dir(ConnectionRef,ChannelId,Dir) ->
+    traverse_abs(ConnectionRef,ChannelId,filename:absname(Dir)).
     
-traverse_abs(ConnectionRef,ChannelId,Dir,Permission) ->
+traverse_abs(ConnectionRef,ChannelId,Dir) ->
     {ok, Filenames} = file:list_dir(Dir),
     F = fun(Name) ->
                 AbsName = filename:absname_join(Dir,Name),
                 case file:read_file_info(AbsName) of
                     {ok, FileInfo} ->
+                        Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
                         case  FileInfo#file_info.type of
                             directory  -> 
                                 io:format("enter Dir ~s~n",[Name]),
-                                send_dir_start(ConnectionRef,ChannelId,Name,Permission),
-                                traverse_abs(ConnectionRef,ChannelId,AbsName,Permission),
+                                send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
+                                traverse_abs(ConnectionRef,ChannelId,AbsName),
                                 send_dir_end(ConnectionRef,ChannelId,Name);
                             regular -> send_file(ConnectionRef,ChannelId,AbsName,Permission,FileInfo#file_info.size);
                             Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transder file type ~p",[Other_File_Type]))}
@@ -101,8 +104,8 @@ traverse_abs(ConnectionRef,ChannelId,Dir,Permission) ->
         end,
     lists:foreach(F, Filenames).
 
-send_dir_start(ConnectionRef,ChannelId,Name,Permission) ->
-    io:format("enter Dir ~s~n",[Name]),
+send_dir_start(ConnectionRef,ChannelId,Name,Permission,Fi) ->
+    io:format("enter Dir ~s, perm ~p ~p ~n",[Name,Permission,Fi#file_info.mode]),
     send_content(ConnectionRef,ChannelId,
                  fun() ->
                          %%send header
@@ -121,30 +124,42 @@ send_dir_end(ConnectionRef, ChannelId, _Name) ->
                          ssh_connection:send(ConnectionRef, ChannelId, Header)
                  end).
 
-send_file(ConnectionRef,ChannelId,Name,Permission,_Size) ->
-    case file:read_file(Name) of 
-        {ok, Content} ->
-            R0 = send_content(ConnectionRef,ChannelId,
-                              fun() ->
-                                      %%send header
-                                      Header = list_to_binary(lists:flatten(io_lib:format("C~s ~p ~s~n",[Permission, size(Content), filename:basename(Name)]))),
-                                      io:format("file header ~s~n",[Header]),
-                                      ssh_connection:send(ConnectionRef, ChannelId, Header)
-                              end),
-            case (R0) of
-                ok -> 
-                    send_content(ConnectionRef,ChannelId,
-                                 fun() ->
-                                         %%ok send file
-                                         io:format("file content ~n",[]),
-                                         ssh_connection:send(ConnectionRef, ChannelId, Content),
-                                         ssh_connection:send(ConnectionRef, ChannelId, <<"\0">>)
-                                 end);
-                _  -> R0
+send_file(ConnectionRef,ChannelId,Name,Permission,Size) ->
+    
+    case file:open(Name, [read, binary, raw]) of
+        {ok, Handle} -> 
+            case send_content(ConnectionRef,ChannelId,
+                         fun() ->
+                                 %%send header
+                                 Header = list_to_binary(lists:flatten(io_lib:format("C~s ~p ~s~n",[Permission, Size, filename:basename(Name)]))),
+                                 io:format("file header ~s~n",[Header]),
+                                 ssh_connection:send(ConnectionRef, ChannelId, Header)
+                         end) of 
+                ok -> TransferResult = send_file_in_chunks(ConnectionRef,ChannelId,Handle),
+                      file:close(Handle),
+                      TransferResult
             end;
         {error, Reason2} -> {error, Reason2}
     end.
 
+send_file_in_chunks(ConnectionRef,ChannelId,Handle) ->
+    case file:read(Handle, ?DEFAULT_PACKET_SIZE) of %% use packetsize as chunksize
+        {ok, Content} -> 
+            case send_content(ConnectionRef,ChannelId,
+                              fun() ->
+                                      %%ok send file
+                                      io:format("file content ~n",[]),
+                                      ssh_connection:send(ConnectionRef, ChannelId, Content)
+                              end) of
+                ok -> send_file_in_chunks(ConnectionRef,ChannelId,Handle);
+                Err -> Err
+            end;
+        eof -> ssh_connection:send(ConnectionRef, ChannelId, <<"\0">>)
+    end.
+
+%%
+%% Actually does final receive of 0 byte, thereby honouring end of transfer
+%%
 send_eof(ConnectionRef,ChannelId) ->
     send_content(ConnectionRef,ChannelId, fun() -> ok end).
     
@@ -201,7 +216,7 @@ with_transfer_channel(ConnectionRef, Timeout, Destination, F) ->
 file_mode_to_permission_string(Mode) when is_atom(Mode) ->
     undefined;
 file_mode_to_permission_string(Mode) when is_integer(Mode), Mode >= 0, Mode =< 65535 ->
-    <<_H1:1,H:6,O:3,G:3,R:3>> = Mode,
+    <<_H1:4,H:3,O:3,G:3,R:3>> = <<Mode:16>>,
     lists:concat(io_lib:format("~B~B~B~B",[H,O,G,R])).
 
 
@@ -267,14 +282,14 @@ to_remote_small_file(SSHConnection) ->
     ok = file:write_file(LocalFilename, Content),
     {ok, ConnectionRef} = SSHConnection,
     ?debugFmt("Connection established ~p",[ConnectionRef]),
-    ok = ssh_scp:to(ConnectionRef, LocalFilename,"/tmp","0666"),
+    ok = ssh_scp:to(ConnectionRef, LocalFilename,"/tmp"),
     {ok, Content} = file:read_file("/tmp/"++filename:basename(LocalFilename)),
     ok = file:delete(LocalFilename).
 
 to_remote_directory(SSHConnection) ->
     {ok, ConnectionRef} = SSHConnection,
     ?debugFmt("Connection established ~p",[ConnectionRef]),
-    ok = ssh_scp:to(ConnectionRef, "DirA","/tmp","0777").
+    ok = ssh_scp:to(ConnectionRef, "DirA","/tmp").
     
     
 
