@@ -42,7 +42,7 @@ to(ConnectionRef, Filename, Destination) ->
 %%--------------------------------------------------------------------
 to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts) ->
     Timeout = case Opts#ssh_scp_opts.timeout of undefined -> 30000; T -> T end,
-    case (file:read_file_info(Filename)) of 
+    case (file:read_file_info(Filename,[{time,posix}])) of 
       {ok, FileInfo} ->
             Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
             case FileInfo#file_info.type of
@@ -50,6 +50,7 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
                     with_transfer_channel(
                       ConnectionRef,Timeout, Destination,
                       fun(ChannelId) -> 
+                              send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
                               case send_file(ConnectionRef,ChannelId,Filename,Permission,FileInfo#file_info.size) of 
                                   ok -> send_eof(ConnectionRef,ChannelId);
                                   Err -> Err
@@ -60,6 +61,7 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
                       ConnectionRef,Timeout, Destination,
                       fun(ChannelId) ->
                               Name = filename:basename(Filename),
+                              send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
                               case send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo) of
                                   ok ->
                                       case send_dir(ConnectionRef,ChannelId,Filename) of
@@ -87,22 +89,41 @@ traverse_abs(ConnectionRef,ChannelId,Dir) ->
     {ok, Filenames} = file:list_dir(Dir),
     F = fun(Name) ->
                 AbsName = filename:absname_join(Dir,Name),
-                case file:read_file_info(AbsName) of
+                case file:read_file_info(AbsName,[{time,posix}]) of
                     {ok, FileInfo} ->
                         Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
                         case  FileInfo#file_info.type of
                             directory  -> 
                                 io:format("enter Dir ~s~n",[Name]),
+                                send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
                                 send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
                                 traverse_abs(ConnectionRef,ChannelId,AbsName),
                                 send_dir_end(ConnectionRef,ChannelId,Name);
-                            regular -> send_file(ConnectionRef,ChannelId,AbsName,Permission,FileInfo#file_info.size);
+                            
+                            regular ->
+                                send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
+                                send_file(ConnectionRef,ChannelId,AbsName,Permission,FileInfo#file_info.size);
                             Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transder file type ~p",[Other_File_Type]))}
                         end;
                     {error, Reason1} -> {error, Reason1}
                 end
         end,
     lists:foreach(F, Filenames).
+
+send_time_info(ConnectionRef,ChannelId,TimeTuple) ->
+    case TimeTuple of
+        {undefined,_} -> ok;
+        {_,undefined} -> ok;
+        {Mtime, Atime} ->
+            send_content(ConnectionRef,ChannelId,
+                         fun() ->
+                                 %%send header
+                                 Header = list_to_binary(lists:flatten(io_lib:format("T~B 0 ~B 0~n",[Mtime,Atime]))),
+                                 io:format("Time header ~s~n",[Header]),
+                                 ssh_connection:send(ConnectionRef, ChannelId, Header)
+                 end)
+    end.
+
 
 send_dir_start(ConnectionRef,ChannelId,Name,Permission,Fi) ->
     io:format("enter Dir ~s, perm ~p ~p ~n",[Name,Permission,Fi#file_info.mode]),
