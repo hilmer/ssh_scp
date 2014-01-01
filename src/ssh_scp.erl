@@ -15,7 +15,7 @@
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
--include("test_setup/localhost_connection.hrl").
+-include("localhost_connection.hrl").
 -endif.
 
 -export([to/3,to/4]).
