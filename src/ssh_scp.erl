@@ -51,11 +51,12 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
                       ConnectionRef,Timeout, Destination,
                       fun(ChannelId) -> 
                               send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
-                              case send_file(ConnectionRef,ChannelId,Filename,Permission,FileInfo#file_info.size) of 
+                              case send_file(ConnectionRef,ChannelId,Filename,Filename,Permission,FileInfo#file_info.size) of 
                                   ok -> send_eof(ConnectionRef,ChannelId);
                                   Err -> Err
                               end
                       end);
+
                 directory -> 
                     with_transfer_channel(
                       ConnectionRef,Timeout, Destination,
@@ -63,18 +64,38 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
                               Name = filename:basename(Filename),
                               send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
                               case send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo) of
-                                  ok ->
-                                      case send_dir(ConnectionRef,ChannelId,Filename) of
-                                          ok -> case send_dir_end(ConnectionRef, ChannelId, Name) of
-                                                    ok -> send_eof(ConnectionRef,ChannelId);
-                                                    Err1 -> Err1
-                                                end;
-                                          Err2 -> Err2
-                                      end;
+                                  ok -> case send_dir(ConnectionRef,ChannelId,Filename) of
+                                            ok -> case send_dir_end(ConnectionRef, ChannelId, Name) of
+                                                      ok -> send_eof(ConnectionRef,ChannelId);
+                                                      Err1 -> Err1
+                                                  end;
+                                            Err2 -> Err2
+                                        end;
                                   Err3 -> Err3
                               end
                       end);
-                Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transder file type ~p",[Other_File_Type]))}
+                symlink -> 
+                    with_transfer_channel(
+                      ConnectionRef,Timeout, Destination,
+                      fun(ChannelId) ->
+                              Name = filename:basename(Filename),
+                              send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
+                              Res = case follow_link(Filename) of
+                                        {regular, LinkedName, LinkedFileInfo} ->
+                                            send_file(ConnectionRef,ChannelId,LinkedName,Filename,Permission,LinkedFileInfo#file_info.size);
+                                        {directory, LinkedName, _LinkedFileInfo} ->
+                                            send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
+                                            traverse_abs(ConnectionRef,ChannelId,LinkedName),
+                                            send_dir_end(ConnectionRef,ChannelId,Name);
+                                        {error, ReasonL} -> {error, ReasonL}
+                                    end,
+                              case Res of
+                                  ok -> send_eof(ConnectionRef,ChannelId);
+                                  Err1 -> Err1
+                              end
+                      end);
+
+                Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
             end;
         {error, Reason1} -> {error, Reason1}
     end.
@@ -92,18 +113,29 @@ traverse_abs(ConnectionRef,ChannelId,Dir) ->
                 case file:read_file_info(AbsName,[{time,posix}]) of
                     {ok, FileInfo} ->
                         Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
+                        send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
                         case  FileInfo#file_info.type of
                             directory  -> 
                                 io:format("enter Dir ~s~n",[Name]),
-                                send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
                                 send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
                                 traverse_abs(ConnectionRef,ChannelId,AbsName),
                                 send_dir_end(ConnectionRef,ChannelId,Name);
                             
                             regular ->
-                                send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
-                                send_file(ConnectionRef,ChannelId,AbsName,Permission,FileInfo#file_info.size);
-                            Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transder file type ~p",[Other_File_Type]))}
+                                send_file(ConnectionRef,ChannelId,AbsName,AbsName,Permission,FileInfo#file_info.size);
+
+                            symlink-> 
+                                case follow_link(AbsName) of
+                                    {regular, LinkedName, LinkedFileInfo} ->
+                                        send_file(ConnectionRef,ChannelId,LinkedName,AbsName,Permission,LinkedFileInfo#file_info.size);
+                                    {directory, LinkedName, _LinkedFileInfo} ->
+                                        send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
+                                        traverse_abs(ConnectionRef,ChannelId,LinkedName),
+                                        send_dir_end(ConnectionRef,ChannelId,Name);
+                                    {error, ReasonL} -> {error, ReasonL}
+                                end;
+
+                            Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
                         end;
                     {error, Reason1} -> {error, Reason1}
                 end
@@ -145,14 +177,14 @@ send_dir_end(ConnectionRef, ChannelId, _Name) ->
                          ssh_connection:send(ConnectionRef, ChannelId, Header)
                  end).
 
-send_file(ConnectionRef,ChannelId,Name,Permission,Size) ->
+send_file(ConnectionRef,ChannelId,Name,TransferName,Permission,Size) ->
     
     case file:open(Name, [read, binary, raw]) of
         {ok, Handle} -> 
             case send_content(ConnectionRef,ChannelId,
                          fun() ->
                                  %%send header
-                                 Header = list_to_binary(lists:flatten(io_lib:format("C~s ~p ~s~n",[Permission, Size, filename:basename(Name)]))),
+                                 Header = list_to_binary(lists:flatten(io_lib:format("C~s ~p ~s~n",[Permission, Size, filename:basename(TransferName)]))),
                                  io:format("file header ~s~n",[Header]),
                                  ssh_connection:send(ConnectionRef, ChannelId, Header)
                          end) of 
@@ -240,7 +272,22 @@ file_mode_to_permission_string(Mode) when is_integer(Mode), Mode >= 0, Mode =< 6
     <<_H1:4,H:3,O:3,G:3,R:3>> = <<Mode:16>>,
     lists:concat(io_lib:format("~B~B~B~B",[H,O,G,R])).
 
-
+follow_link(Name) ->
+    case file:read_link(Name) of
+        {ok, LinkedName} -> 
+            case file:read_file_info(LinkedName,[{time,posix}]) of
+                {ok, FileInfo} ->
+                    case  FileInfo#file_info.type of
+                        directory  -> {directory, LinkedName, FileInfo};
+                        regular  -> {regular,LinkedName, FileInfo};
+                        symlink  -> follow_link(LinkedName);
+                        Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
+                    end;
+                Err2 -> Err2
+            end;
+        Err -> Err
+    end.
+    
 
 %%--------------------------------------------------------------------
 %% TEST functions
