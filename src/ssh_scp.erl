@@ -1,5 +1,4 @@
 %%% @author Søren Hilmer <sh@widetrail.dk>
-%%% @copyright (C) 2013, Søren Hilmer
 %%% @doc
 %%% ssh_scp module implementing client side scp (Secure CoPy) in Erlang
 %%% @end
@@ -18,7 +17,7 @@
 -include("localhost_connection.hrl").
 -endif.
 
--export([to/3,to/4]).
+-export([to/3,to/4,to/5]).
 
 %%--------------------------------------------------------------------
 %% @doc copies the file in Filename to the remote and place it in Destination 
@@ -49,7 +48,35 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
                   ok -> send_eof(ConnectionRef,ChannelId);
                   Err -> Err
               end
+      end);
+
+to(ConnectionRef, Filename, Destination, Content) when is_binary(Content) ->
+    ssh_scp:to(ConnectionRef, Filename, Destination, Content, #ssh_scp_opts{timeout=30000}).
+
+
+to(ConnectionRef, Filename, Destination, Content, Opts) when is_binary(Content),is_record(Opts, ssh_scp_opts) ->
+    Timeout = case Opts#ssh_scp_opts.timeout of undefined -> 30000; T -> T end,
+    Permission = file_mode_to_permission_string(Opts#ssh_scp_opts.mode),
+    with_transfer_channel(
+      ConnectionRef,Timeout, Destination,
+      fun(ChannelId) -> 
+              case send_time_info(ConnectionRef,ChannelId,{Opts#ssh_scp_opts.mtime, Opts#ssh_scp_opts.atime}) of
+                  ok ->
+                      case send_file_header(ConnectionRef,ChannelId,Filename,Permission,length(Content)) of
+                          ok -> case  send_content(ConnectionRef,ChannelId,
+                                                   fun() ->
+                                                           %%send content
+                                                           ssh_connection:send(ConnectionRef, ChannelId, Content)
+                                                   end) of
+                                    ok -> send_eof(ConnectionRef,ChannelId);
+                                    Err2 -> Err2
+                                end;
+                          Err -> Err
+                      end;
+                  Err3  -> Err3
+              end
       end).
+
 
 %%--------------------------------------------------------------------  
 %% Traverse directory structure recursively. And transfer files
@@ -58,35 +85,37 @@ traverse(ConnectionRef,ChannelId,AbsName) ->
     case file:read_file_info(AbsName,[{time,posix}]) of
         {ok, FileInfo} ->
             Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
-            send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
-            case  FileInfo#file_info.type of
-                directory  -> 
-                    io:format("enter Dir ~s~n",[AbsName]),
-                    send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission,FileInfo),
-                    
-                    {ok, Filenames} = file:list_dir(AbsName),
-                    lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(AbsName,BaseName)) end, Filenames),
-                    
-                    send_dir_end(ConnectionRef,ChannelId,filename:basename(AbsName));
-                
-                regular ->
-                    send_file(ConnectionRef,ChannelId,AbsName,AbsName,Permission,FileInfo#file_info.size);
-                
-                symlink-> 
-                    case follow_link(AbsName) of
-                        {regular, LinkedName, LinkedFileInfo} ->
-                            send_file(ConnectionRef,ChannelId,LinkedName,AbsName,Permission,LinkedFileInfo#file_info.size);
-                        {directory, LinkedName, _LinkedFileInfo} ->
-                            send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission,FileInfo),
+            case send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}) of
+                ok ->
+                    case  FileInfo#file_info.type of
+                        directory  -> 
+                            send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission),
                             
-                            {ok, Filenames} = file:list_dir(LinkedName),
-                            lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(LinkedName,BaseName)) end, Filenames),
+                            {ok, Filenames} = file:list_dir(AbsName),
+                            lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(AbsName,BaseName)) end, Filenames),
                             
                             send_dir_end(ConnectionRef,ChannelId,filename:basename(AbsName));
-                        {error, ReasonL} -> {error, ReasonL}
+                        
+                        regular ->
+                            send_file(ConnectionRef,ChannelId,AbsName,AbsName,Permission,FileInfo#file_info.size);
+                        
+                        symlink-> 
+                            case follow_link(AbsName) of
+                                {regular, LinkedName, LinkedFileInfo} ->
+                                    send_file(ConnectionRef,ChannelId,LinkedName,AbsName,Permission,LinkedFileInfo#file_info.size);
+                                {directory, LinkedName, _LinkedFileInfo} ->
+                                    send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission),
+                                    
+                                    {ok, Filenames} = file:list_dir(LinkedName),
+                                    lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(LinkedName,BaseName)) end, Filenames),
+                                    
+                                    send_dir_end(ConnectionRef,ChannelId,filename:basename(AbsName));
+                                {error, ReasonL} -> {error, ReasonL}
+                            end;
+                        
+                        Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
                     end;
-                
-                Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
+                Err -> Err
             end;
         {error, Reason1} -> {error, Reason1}
     end.
@@ -100,46 +129,43 @@ send_time_info(ConnectionRef,ChannelId,TimeTuple) ->
                          fun() ->
                                  %%send header
                                  Header = list_to_binary(lists:flatten(io_lib:format("T~B 0 ~B 0~n",[Mtime,Atime]))),
-                                 io:format("Time header ~s~n",[Header]),
                                  ssh_connection:send(ConnectionRef, ChannelId, Header)
                  end)
     end.
 
 
-send_dir_start(ConnectionRef,ChannelId,Name,Permission,Fi) ->
-    io:format("enter Dir ~s, perm ~p ~p ~n",[Name,Permission,Fi#file_info.mode]),
+send_dir_start(ConnectionRef,ChannelId,Name,Permission) ->
     send_content(ConnectionRef,ChannelId,
                  fun() ->
                          %%send header
                          Header = list_to_binary(lists:flatten(io_lib:format("D~s ~p ~s~n",[Permission, 0, Name]))),
-                         io:format("start dir header ~s~n",[Header]),
                          ssh_connection:send(ConnectionRef, ChannelId, Header)
                  end).
     
 send_dir_end(ConnectionRef, ChannelId, _Name) ->
-    io:format("exit Dir ~s~n",[_Name]),
     send_content(ConnectionRef,ChannelId,
                  fun() ->
                          %%send end dir
                          Header = list_to_binary(lists:flatten(io_lib:format("E~n",[]))),
-                         io:format("end dir header ~s~n",[Header]),
+                         ssh_connection:send(ConnectionRef, ChannelId, Header)
+                 end).
+
+send_file_header(ConnectionRef,ChannelId,Name,Permission,Size) ->
+    send_content(ConnectionRef,ChannelId,
+                 fun() ->
+                         %%send header
+                         Header = list_to_binary(lists:flatten(io_lib:format("C~s ~p ~s~n",[Permission, Size, Name]))),
                          ssh_connection:send(ConnectionRef, ChannelId, Header)
                  end).
 
 send_file(ConnectionRef,ChannelId,Name,TransferName,Permission,Size) ->
-    
     case file:open(Name, [read, binary, raw]) of
         {ok, Handle} -> 
-            case send_content(ConnectionRef,ChannelId,
-                         fun() ->
-                                 %%send header
-                                 Header = list_to_binary(lists:flatten(io_lib:format("C~s ~p ~s~n",[Permission, Size, filename:basename(TransferName)]))),
-                                 io:format("file header ~s~n",[Header]),
-                                 ssh_connection:send(ConnectionRef, ChannelId, Header)
-                         end) of 
+            case  send_file_header(ConnectionRef,ChannelId,filename:basename(TransferName),Permission,Size) of 
                 ok -> TransferResult = send_file_in_chunks(ConnectionRef,ChannelId,Handle),
                       file:close(Handle),
-                      TransferResult
+                      TransferResult;
+                Err -> file:close(Handle), Err
             end;
         {error, Reason2} -> {error, Reason2}
     end.
@@ -150,7 +176,6 @@ send_file_in_chunks(ConnectionRef,ChannelId,Handle) ->
             case send_content(ConnectionRef,ChannelId,
                               fun() ->
                                       %%ok send file
-                                      io:format("file content ~n",[]),
                                       ssh_connection:send(ConnectionRef, ChannelId, Content)
                               end) of
                 ok -> send_file_in_chunks(ConnectionRef,ChannelId,Handle);
