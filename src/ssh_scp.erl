@@ -42,105 +42,54 @@ to(ConnectionRef, Filename, Destination) ->
 %%--------------------------------------------------------------------
 to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts) ->
     Timeout = case Opts#ssh_scp_opts.timeout of undefined -> 30000; T -> T end,
-    case (file:read_file_info(Filename,[{time,posix}])) of 
-      {ok, FileInfo} ->
-            Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
-            case FileInfo#file_info.type of
-                regular ->
-                    with_transfer_channel(
-                      ConnectionRef,Timeout, Destination,
-                      fun(ChannelId) -> 
-                              send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
-                              case send_file(ConnectionRef,ChannelId,Filename,Filename,Permission,FileInfo#file_info.size) of 
-                                  ok -> send_eof(ConnectionRef,ChannelId);
-                                  Err -> Err
-                              end
-                      end);
-
-                directory -> 
-                    with_transfer_channel(
-                      ConnectionRef,Timeout, Destination,
-                      fun(ChannelId) ->
-                              Name = filename:basename(Filename),
-                              send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
-                              case send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo) of
-                                  ok -> case send_dir(ConnectionRef,ChannelId,Filename) of
-                                            ok -> case send_dir_end(ConnectionRef, ChannelId, Name) of
-                                                      ok -> send_eof(ConnectionRef,ChannelId);
-                                                      Err1 -> Err1
-                                                  end;
-                                            Err2 -> Err2
-                                        end;
-                                  Err3 -> Err3
-                              end
-                      end);
-                symlink -> 
-                    with_transfer_channel(
-                      ConnectionRef,Timeout, Destination,
-                      fun(ChannelId) ->
-                              Name = filename:basename(Filename),
-                              send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
-                              Res = case follow_link(Filename) of
-                                        {regular, LinkedName, LinkedFileInfo} ->
-                                            send_file(ConnectionRef,ChannelId,LinkedName,Filename,Permission,LinkedFileInfo#file_info.size);
-                                        {directory, LinkedName, _LinkedFileInfo} ->
-                                            send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
-                                            traverse_abs(ConnectionRef,ChannelId,LinkedName),
-                                            send_dir_end(ConnectionRef,ChannelId,Name);
-                                        {error, ReasonL} -> {error, ReasonL}
-                                    end,
-                              case Res of
-                                  ok -> send_eof(ConnectionRef,ChannelId);
-                                  Err1 -> Err1
-                              end
-                      end);
-
-                Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
-            end;
-        {error, Reason1} -> {error, Reason1}
-    end.
+    with_transfer_channel(
+      ConnectionRef,Timeout, Destination,
+      fun(ChannelId) -> 
+              case traverse(ConnectionRef,ChannelId,filename:absname(Filename)) of 
+                  ok -> send_eof(ConnectionRef,ChannelId);
+                  Err -> Err
+              end
+      end).
 
 %%--------------------------------------------------------------------  
 %% Traverse directory structure recursively. And transfer files
 %%--------------------------------------------------------------------  
-send_dir(ConnectionRef,ChannelId,Dir) ->
-    traverse_abs(ConnectionRef,ChannelId,filename:absname(Dir)).
-    
-traverse_abs(ConnectionRef,ChannelId,Dir) ->
-    {ok, Filenames} = file:list_dir(Dir),
-    F = fun(Name) ->
-                AbsName = filename:absname_join(Dir,Name),
-                case file:read_file_info(AbsName,[{time,posix}]) of
-                    {ok, FileInfo} ->
-                        Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
-                        send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
-                        case  FileInfo#file_info.type of
-                            directory  -> 
-                                io:format("enter Dir ~s~n",[Name]),
-                                send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
-                                traverse_abs(ConnectionRef,ChannelId,AbsName),
-                                send_dir_end(ConnectionRef,ChannelId,Name);
+traverse(ConnectionRef,ChannelId,AbsName) ->
+    case file:read_file_info(AbsName,[{time,posix}]) of
+        {ok, FileInfo} ->
+            Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
+            send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}),
+            case  FileInfo#file_info.type of
+                directory  -> 
+                    io:format("enter Dir ~s~n",[AbsName]),
+                    send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission,FileInfo),
+                    
+                    {ok, Filenames} = file:list_dir(AbsName),
+                    lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(AbsName,BaseName)) end, Filenames),
+                    
+                    send_dir_end(ConnectionRef,ChannelId,filename:basename(AbsName));
+                
+                regular ->
+                    send_file(ConnectionRef,ChannelId,AbsName,AbsName,Permission,FileInfo#file_info.size);
+                
+                symlink-> 
+                    case follow_link(AbsName) of
+                        {regular, LinkedName, LinkedFileInfo} ->
+                            send_file(ConnectionRef,ChannelId,LinkedName,AbsName,Permission,LinkedFileInfo#file_info.size);
+                        {directory, LinkedName, _LinkedFileInfo} ->
+                            send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission,FileInfo),
                             
-                            regular ->
-                                send_file(ConnectionRef,ChannelId,AbsName,AbsName,Permission,FileInfo#file_info.size);
-
-                            symlink-> 
-                                case follow_link(AbsName) of
-                                    {regular, LinkedName, LinkedFileInfo} ->
-                                        send_file(ConnectionRef,ChannelId,LinkedName,AbsName,Permission,LinkedFileInfo#file_info.size);
-                                    {directory, LinkedName, _LinkedFileInfo} ->
-                                        send_dir_start(ConnectionRef,ChannelId,Name,Permission,FileInfo),
-                                        traverse_abs(ConnectionRef,ChannelId,LinkedName),
-                                        send_dir_end(ConnectionRef,ChannelId,Name);
-                                    {error, ReasonL} -> {error, ReasonL}
-                                end;
-
-                            Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
-                        end;
-                    {error, Reason1} -> {error, Reason1}
-                end
-        end,
-    lists:foreach(F, Filenames).
+                            {ok, Filenames} = file:list_dir(LinkedName),
+                            lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(LinkedName,BaseName)) end, Filenames),
+                            
+                            send_dir_end(ConnectionRef,ChannelId,filename:basename(AbsName));
+                        {error, ReasonL} -> {error, ReasonL}
+                    end;
+                
+                Other_File_Type -> {error, list_to_binary(io_lib:format("Cannot transfer file type ~p",[Other_File_Type]))}
+            end;
+        {error, Reason1} -> {error, Reason1}
+    end.
 
 send_time_info(ConnectionRef,ChannelId,TimeTuple) ->
     case TimeTuple of
