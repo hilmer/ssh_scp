@@ -17,7 +17,7 @@
 -include("localhost_connection.hrl").
 -endif.
 
--export([to/3,to/4,to/5]).
+-export([to/3,to/4,to_file/4,to_file/5,to_file/6]).
 
 %%--------------------------------------------------------------------
 %% @doc copies the file in Filename to the remote and place it in Destination 
@@ -44,17 +44,19 @@ to(ConnectionRef, Filename, Destination, Opts) when is_record(Opts, ssh_scp_opts
     with_transfer_channel(
       ConnectionRef,Timeout, Destination,
       fun(ChannelId) -> 
-              case traverse(ConnectionRef,ChannelId,filename:absname(Filename)) of 
+              case traverse(ConnectionRef,ChannelId,filename:absname(Filename),Opts) of 
                   ok -> send_eof(ConnectionRef,ChannelId);
                   Err -> Err
               end
-      end);
+      end).
 
-to(ConnectionRef, Filename, Destination, Content) when is_binary(Content) ->
-    ssh_scp:to(ConnectionRef, Filename, Destination, Content, #ssh_scp_opts{timeout=30000}).
+to_file(ConnectionRef, Filename, Destination, Content) when is_binary(Content) ->
+    ssh_scp:to_file(ConnectionRef, Filename, Destination, Content, #ssh_scp_opts{timeout=30000,mode=permission_string_to_file_mode("0640")}).
 
+to_file(ConnectionRef, Filename, Destination, Content, Permission) when is_binary(Content),is_list(Permission) ->
+    ssh_scp:to_file(ConnectionRef, Filename, Destination, Content, #ssh_scp_opts{timeout=30000,mode=permission_string_to_file_mode(Permission)});
 
-to(ConnectionRef, Filename, Destination, Content, Opts) when is_binary(Content),is_record(Opts, ssh_scp_opts) ->
+to_file(ConnectionRef, Filename, Destination, Content, Opts) when is_binary(Content),is_record(Opts, ssh_scp_opts) ->
     Timeout = case Opts#ssh_scp_opts.timeout of undefined -> 30000; T -> T end,
     Permission = file_mode_to_permission_string(Opts#ssh_scp_opts.mode),
     with_transfer_channel(
@@ -77,22 +79,28 @@ to(ConnectionRef, Filename, Destination, Content, Opts) when is_binary(Content),
               end
       end).
 
+to_file(ConnectionRef, Filename, Destination, Content, Timeout, Permission) when is_binary(Content),is_integer(Timeout),is_list(Permission) ->
+    ssh_scp:to_file(ConnectionRef, Filename, Destination, Content, #ssh_scp_opts{timeout=Timeout,mode=permission_string_to_file_mode(Permission)}).
+
 
 %%--------------------------------------------------------------------  
 %% Traverse directory structure recursively. And transfer files
 %%--------------------------------------------------------------------  
-traverse(ConnectionRef,ChannelId,AbsName) ->
+traverse(ConnectionRef,ChannelId,AbsName, Opts) when is_record(Opts, ssh_scp_opts) ->
     case file:read_file_info(AbsName,[{time,posix}]) of
         {ok, FileInfo} ->
             Permission = file_mode_to_permission_string(FileInfo#file_info.mode),
-            case send_time_info(ConnectionRef,ChannelId,{FileInfo#file_info.mtime,FileInfo#file_info.atime}) of
+            MTime = time_to_use(Opts#ssh_scp_opts.mtime, FileInfo#file_info.mtime),
+            ATime = time_to_use(Opts#ssh_scp_opts.atime, FileInfo#file_info.atime),
+
+            case send_time_info(ConnectionRef,ChannelId,{MTime,ATime}) of
                 ok ->
                     case  FileInfo#file_info.type of
                         directory  -> 
                             send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission),
                             
                             {ok, Filenames} = file:list_dir(AbsName),
-                            lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(AbsName,BaseName)) end, Filenames),
+                            lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(AbsName,BaseName),Opts) end, Filenames),
                             
                             send_dir_end(ConnectionRef,ChannelId,filename:basename(AbsName));
                         
@@ -107,7 +115,7 @@ traverse(ConnectionRef,ChannelId,AbsName) ->
                                     send_dir_start(ConnectionRef,ChannelId,filename:basename(AbsName),Permission),
                                     
                                     {ok, Filenames} = file:list_dir(LinkedName),
-                                    lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(LinkedName,BaseName)) end, Filenames),
+                                    lists:foreach(fun(BaseName)-> traverse(ConnectionRef,ChannelId,filename:join(LinkedName,BaseName),Opts) end, Filenames),
                                     
                                     send_dir_end(ConnectionRef,ChannelId,filename:basename(AbsName));
                                 {error, ReasonL} -> {error, ReasonL}
@@ -119,6 +127,11 @@ traverse(ConnectionRef,ChannelId,AbsName) ->
             end;
         {error, Reason1} -> {error, Reason1}
     end.
+
+time_to_use(undefined,FileTime) ->
+    FileTime;
+time_to_use(OptsTime,_FileTime) ->
+    OptsTime.
 
 send_time_info(ConnectionRef,ChannelId,TimeTuple) ->
     case TimeTuple of
@@ -245,6 +258,9 @@ file_mode_to_permission_string(Mode) when is_atom(Mode) ->
 file_mode_to_permission_string(Mode) when is_integer(Mode), Mode >= 0, Mode =< 65535 ->
     <<_H1:4,H:3,O:3,G:3,R:3>> = <<Mode:16>>,
     lists:concat(io_lib:format("~B~B~B~B",[H,O,G,R])).
+
+permission_string_to_file_mode(Permission) when is_list(Permission) ->
+    lists:foldl(fun(C,Acc)-> <<Acc/bitstring,C:3>> end, <<0:4>>, Permission).
 
 follow_link(Name) ->
     case file:read_link(Name) of
