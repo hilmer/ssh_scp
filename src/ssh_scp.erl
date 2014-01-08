@@ -260,7 +260,8 @@ file_mode_to_permission_string(Mode) when is_integer(Mode), Mode >= 0, Mode =< 6
     lists:concat(io_lib:format("~B~B~B~B",[H,O,G,R])).
 
 permission_string_to_file_mode(Permission) when is_list(Permission) ->
-    lists:foldl(fun(C,Acc)-> <<Acc/bitstring,C:3>> end, <<0:4>>, Permission).
+    <<Mode:16>> = lists:foldl(fun(C,Acc)-> <<Acc/bitstring,C:3>> end, <<0:4>>, Permission),
+    Mode.
 
 follow_link(Name) ->
     case file:read_link(Name) of
