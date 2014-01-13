@@ -2,8 +2,8 @@ ssh_scp
 =======
 ssh_scp is a client scp module for Erlang.
 
-It can copy files and directory structures and follow symlinks.
-It also allows you to send binary content as a file to the remote side as a file (did that sentence make sense)
+It can copy files and directory structures and it follows symlinks (as standard scp does).
+It also allows you to send binary content to the remote side as a file.
 
 Compile
 -------
