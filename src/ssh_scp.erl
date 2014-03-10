@@ -15,6 +15,8 @@
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 -include("localhost_connection.hrl").
+-else.
+-define(debugFmt, fun(_F,_A) -> ok end).
 -endif.
 
 -export([to/3,to/4,to_file/4,to_file/5,to_file/6]).
@@ -272,7 +274,18 @@ send_file_in_chunks(ConnectionRef,ChannelId,Handle,Timeout) ->
 %% wait for terminating 0, to terminate transfer (or error)
 %%--------------------------------------------------------------
 wait_for_protocol_termination(ConnectionRef,ChannelId,Timeout) ->
-    send_content(ConnectionRef,ChannelId,Timeout, fun() -> ok end).
+    case send_content(ConnectionRef,ChannelId,Timeout, fun() -> ok end) of
+        ok ->
+            case ssh_connection:close(ConnectionRef, ChannelId) of
+                ok ->
+                    case send_content(ConnectionRef,ChannelId,Timeout, fun() -> ok end) of
+                        ok -> send_content(ConnectionRef,ChannelId,Timeout, fun() -> ok end);
+                        Err -> Err
+                    end;
+                Err -> Err
+            end;
+        Err -> Err
+    end.
     
     
 %%--------------------------------------------------------------------
@@ -284,16 +297,12 @@ send_content(ConnectionRef,ChannelId,Timeout,Transfer) ->
     receive
         {ssh_cm, ConnectionRef, Msg} ->
             case Msg of
-                {closed, _ChannelId} ->
-                    ssh_connection:close(ConnectionRef, ChannelId), ok;
+                {closed, _ChannelId} -> ok;
                 {eof, _ChannelId} -> 
-                    ssh_connection:close(ConnectionRef, ChannelId),
                     {error, <<"Error: EOF">>};
                 {exit_signal, _ChannelId, ExitSignal, ErrorMsg, _LanguageString} ->
-                    ssh_connection:close(ConnectionRef, ChannelId),
                     {error, list_to_binary(io_lib:format("Remote SCP exit signal: ~p : ~p",[ExitSignal,ErrorMsg]))};
                 {exit_status,_ChannelId,ExitStatus} ->
-                    ssh_connection:close(ConnectionRef, ChannelId),
                     case ExitStatus of
                         0 -> ok;
                         _ -> {error, list_to_binary(io_lib:format("Remote SCP exit status: ~p",[ExitStatus]))}
